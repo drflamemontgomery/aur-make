@@ -30,8 +30,18 @@ aur_contains() {
   # Test if the package name is an archlinux package
   curl -s https://aur.archlinux.org/$pkg.git | grep -o "pkgbase" 1>/dev/null 2>/dev/null && return 0
 
-  echo -e "${BOLD}$pkg${CLEAR} is not a valid aur package"
+  echo -e "${RED}error:${CLEAR} ${BOLD}$pkg${CLEAR} is not a valid aur package"
 
+  return 1
+}
+
+pacman_contains() {
+  pacman -Si $1 1>/dev/null 2>/dev/null && return 0
+  return 1
+}
+
+pkg_installed() {
+  pacman -Qi $1 1>/dev/null 2>/dev/null && return 0
   return 1
 }
 
@@ -49,7 +59,7 @@ download_package() {
       echo -e "${YELLOW}Downloaded${CLEAR} $BOLD$name$CLEAR" && 
       return 0
 
-    echo -e "${RED}Failed${CLEAR} to download $BOLD$name$CLEAR"
+    echo -e "${RED}error:${CLEAR} Failed to download $BOLD$name$CLEAR"
     return 1
   fi
 }
@@ -58,13 +68,16 @@ download_package() {
 install_dep() {
   local pkg=$1
   local dep=$2
-  
-  pacman -Qi $dep 1>/dev/null 2>/dev/null && return 0
 
-  echo -e "Package $BOLD$pkg$CLEAR depends on $BOLD$dep$CLEAR"
+  pkg_installed $dep && return 0
+
+  if test -n $pkg
+  then
+    echo -e "Package $BOLD$pkg$CLEAR depends on $BOLD$dep$CLEAR"
+  fi
 
   opts=()
-  pacman -Si $dep 1>/dev/null 2>/dev/null && opts+=("Pacman")
+  pacman_contains $dep && opts+=("Pacman")
 
   aur_contains $dep && opts+=("AUR")
 
@@ -153,6 +166,8 @@ install_package() {
   cd $name
   makepkg -si
   cd ..
+
+  echo -e "${GREEN}Success:${CLEAR} Installed $BOLD$name$CLEAR"
 }
 
 for i in ${@}
@@ -170,7 +185,7 @@ failed_file=$(mktemp -p $AURHOME ".fail_XXXXXX.log")
 
 for pkg in $failed_packages
 do
-  echo -e "${RED}Failed to install package:$CLEAR ${BOLD}$pkg${CLEAR}"
+  echo -e "${RED}error:${CLEAR} Failed to install ${BOLD}$pkg${CLEAR}"
   echo "$pkg" >> $failed_file
 done
 
