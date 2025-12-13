@@ -1,0 +1,177 @@
+#!/bin/sh
+
+if test -z $AURHOME
+then
+  AURHOME="$HOME/.local/share/aur"
+fi
+
+# Make $AURHOME if not already existing
+mkdir -p $AURHOME
+cd $AURHOME
+
+# TERMCOLORS
+CLEAR="\e[0m"
+BOLD="\e[1m"
+RED="\e[31m"
+GREEN="\e[32m"
+YELLOW="\e[33m"
+
+# List of failed packages
+failed_packages=()
+
+fail() {
+  echo -e "${RED}error:$CLEAR Failed to install $BOLD$1$CLEAR"
+  failed_packages+=("$1")
+}
+
+# Test if AUR contains package
+aur_contains() {
+  local pkg=$1
+  # Test if the package name is an archlinux package
+  curl -s https://aur.archlinux.org/$pkg.git | grep -o "pkgbase" 1>/dev/null 2>/dev/null && return 0
+
+  echo -e "${BOLD}$pkg${CLEAR} is not a valid aur package"
+
+  return 1
+}
+
+# Download package from aur or update if already existing
+download_package() {
+  local name=$1
+  if test -d "$name"
+  then
+    cd $name
+    git pull | grep -v "Already up to date." 1>/dev/null 2>/dev/null && echo "Updated $name"
+    cd ..
+  else
+    aur_contains $name &&
+      git clone https://aur.archlinux.org/$name.git $name 2>/dev/null 1>/dev/null &&
+      echo -e "${YELLOW}Downloaded${CLEAR} $BOLD$name$CLEAR" && 
+      return 0
+
+    echo -e "${RED}Failed${CLEAR} to download $BOLD$name$CLEAR"
+    return 1
+  fi
+}
+
+# Install a dependency either using AUR or Pacman
+install_dep() {
+  local pkg=$1
+  local dep=$2
+  
+  pacman -Qi $dep 1>/dev/null 2>/dev/null && return 0
+
+  echo -e "Package $BOLD$pkg$CLEAR depends on $BOLD$dep$CLEAR"
+
+  opts=()
+  pacman -Si $dep 1>/dev/null 2>/dev/null && opts+=("Pacman")
+
+  aur_contains $dep && opts+=("AUR")
+
+  opts+=("None")
+
+  echo -e "Pick one of the following programs to install $BOLD$dep$CLEAR"
+  echo ""
+
+  i=1
+  for opt in ${opts[@]}
+  do
+    echo -e "$i) $BOLD$opt$CLEAR"
+    ((i++))
+  done
+
+  echo ""
+
+  read -s -p "(Default: ${opts[0]})? " -n 1 choice
+  echo "$choice"
+
+  while test -n "$choice" && [[ $choice -lt 1 || $choice -gt ${#opts[@]} ]]
+  do
+    read -s -p "Please pick a valid number? " -n 1 choice
+    echo "$choice"
+  done
+  echo ""
+
+  test -z "$choice" && choice=1
+
+  ((choice--))
+
+  case ${opts[$choice]} in
+    "None")
+      return 1
+      ;;
+    "Pacman")
+      /usr/bin/sh -c "sudo pacman -S $dep"
+      ;;
+    "AUR")
+      install_package $dep
+      ;;
+  esac
+}
+
+# Install an AUR package
+install_package() {
+  local name=$1
+  echo -e "Install $BOLD$name$CLEAR from ${BOLD}AUR${CLEAR}"
+
+  download_package $name
+  if test $? -ne 0
+  then
+    fail $name 
+    return 1
+  fi
+
+
+  # Get Dependencies
+  local -A srcinfo
+
+  while IFS="=" read -r key value; do
+    # Skip comments and empty lines
+    [[ "$key" =~ ^\s*# ]] && continue
+    [[ -z "$key" ]] && continue
+
+    # Remove leading/trailing whitespace from key and value
+    key=$(echo "$key" | xargs)
+    value=$(echo "$value" | xargs)
+
+    if [[ -n "$key" ]]; then
+      srcinfo["$key"]+="$value "
+    fi
+  done < "$name/.SRCINFO"
+
+  # Install dependencies
+  for makedep in ${srcinfo["makedepends"]}
+  do
+    local dep=$makedep
+    install_dep $name $dep && continue
+    echo -e "Require ${BOLD}${dep}${CLEAR} to install ${BOLD}${name}${CLEAR}."
+
+    fail $name
+    return 1
+  done
+
+  cd $name
+  makepkg -si
+  cd ..
+}
+
+for i in ${@}
+do
+  install_package $i
+done
+
+test ${#failed_packages[@]} -eq 0 && exit 0
+
+echo ""
+echo "Listing failed packages:"
+echo ""
+
+failed_file=$(mktemp -p $AURHOME ".fail_XXXXXX.log")
+
+for pkg in $failed_packages
+do
+  echo -e "${RED}Failed to install package:$CLEAR ${BOLD}$pkg${CLEAR}"
+  echo "$pkg" >> $failed_file
+done
+
+echo -e "${YELLOW}info:${CLEAR} Fail log can be found at ${BOLD}$failed_file${CLEAR}"
