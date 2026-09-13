@@ -1,192 +1,384 @@
-#!/bin/sh
+#!/usr/bin/python3
 
-if test -z $AURHOME
-then
-  AURHOME="$HOME/.local/share/aur"
-fi
+import sys
+import os
+import re
+import argparse, argcomplete
+import requests
+import subprocess
+import shutil
 
-# Make $AURHOME if not already existing
-mkdir -p $AURHOME
-cd $AURHOME
+from termcolor import colored, cprint
+from collections import deque
+from pathlib import Path
 
-# TERMCOLORS
-CLEAR="\e[0m"
-BOLD="\e[1m"
-RED="\e[31m"
-GREEN="\e[32m"
-YELLOW="\e[33m"
+HOME = os.environ.get("HOME")
+AUR_HOME = os.environ.get("AURHOME") if os.environ.get("AURHOME") else f'{HOME}/.local/share/aur'
+AUR_URL = "https://aur.archlinux.org"
 
-# List of failed packages
-failed_packages=()
+os.makedirs(AUR_HOME, exist_ok=True) if not os.path.exists(AUR_HOME) else ""
 
-fail() {
-  echo -e "${RED}error:$CLEAR Failed to install $BOLD$1$CLEAR"
-  failed_packages+=("$1")
-}
+failed_packages = []
 
-# Test if AUR contains package
-aur_contains() {
-  local pkg=$1
-  # Test if the package name is an archlinux package
-  curl -s https://aur.archlinux.org/$pkg.git | grep -o "pkgbase" 1>/dev/null 2>/dev/null && return 0
+pacman_pkgs = []
+aur_pkgs = []
 
-  echo -e "${RED}error:${CLEAR} ${BOLD}$pkg${CLEAR} is not a valid aur package"
+def PkgCompleter(prefix, parsed_args, **kwargs):
+    if parsed_args.clear_cache:
+        path = Path(parsed_args.home_dir)
+        dirs = [entry.name for entry in os.scandir(path) if entry.is_dir()]
+        dir_dict = {}
+        for d in dirs:
+            dir_dict[d] = d
+        
+        return dir_dict
 
-  return 1
-}
+    return None
 
-pacman_contains() {
-  pacman -Si $1 1>/dev/null 2>/dev/null && return 0
-  return 1
-}
+class PacmanPkgData:
+    def __init__(self, name, is_dep=False):
+        self.name = name
+        self.is_dep = is_dep
 
-pkg_installed() {
-  pacman -Qi $1 1>/dev/null 2>/dev/null && return 0
-  return 1
-}
+    def __eq__(self, other):
+        if isinstance(other, str):
+            return self.name == other
+        elif not isinstance(other, PacmanPkgData):
+            return False
+        return self.name == other.name
 
-# Download package from aur or update if already existing
-download_package() {
-  local name=$1
-  if test -d "$name"
-  then
-    cd $name
-    git pull | grep -v "Already up to date." 1>/dev/null 2>/dev/null && echo "Updated $name"
-    cd ..
-  else
-    aur_contains $name &&
-      git clone https://aur.archlinux.org/$name.git $name 2>/dev/null 1>/dev/null &&
-      echo -e "${YELLOW}Downloaded${CLEAR} $BOLD$name$CLEAR" && 
-      return 0
+    def __hash__(self):
+        return hash(self.name)
 
-    echo -e "${RED}error:${CLEAR} Failed to download $BOLD$name$CLEAR"
-    return 1
-  fi
-}
+    def __repr__(self):
+        return f"PacmanPkgData(name='{self.name}', is_dep='{self.is_dep}')"
 
-# Install a dependency either using AUR or Pacman
-install_dep() {
-  local pkg=$1
-  local dep=$2
+class AurPkgData:
+    def __init__(self, name, parent=None):
+        self.name = name
+        self.children = set()
+        self.parent = parent
 
-  pkg_installed $dep && return 0
+        if parent:
+            parent.children.add(self)
 
-  if test -n $pkg
-  then
-    echo -e "Package $BOLD$pkg$CLEAR depends on $BOLD$dep$CLEAR"
-  fi
+    def __eq__(self, other):
+        if isinstance(other, str):
+            return self.name == other
+        elif not isinstance(other, AurPkgData):
+            return False
+        return self.name == other.name
 
-  opts=()
-  pacman_contains $dep && opts+=("Pacman")
+    def __hash__(self):
+        return hash(self.name)
 
-  aur_contains $dep && opts+=("AUR")
+    def __repr__(self):
+        return f"AurPkgData(name='{self.name}', parent='{self.parent.name if self.parent else 'None'}')"
 
-  opts+=("None")
+class PackageException(Exception):
+    pass
 
-  echo -e "Pick one of the following programs to install $BOLD$dep$CLEAR"
-  echo ""
+def package_queued(pkgname):
+    for pkg in pacman_pkgs:
+        if pkg.name == pkgname:
+            return True
+    for pkg in aur_pkgs:
+        if pkg.name == pkgname:
+            return True
 
-  i=1
-  for opt in ${opts[@]}
-  do
-    echo -e "$i) $BOLD$opt$CLEAR"
-    ((i++))
-  done
+def aur_exists(pkgname):
+    url = f"{AUR_URL}/{pkgname}.git"
+    
+    response = requests.get(url)
 
-  echo ""
+    text_body = response.text
+    return re.search(r"\bpkgbase\b", text_body) != None
 
-  read -s -p "(Default: ${opts[0]})? " -n 1 choice
-  echo "$choice"
+def pacman_exists(pkgname):
+    cmd = ['pacman', '-Si', pkgname]
+    result = subprocess.run(cmd, capture_output=True, text=True)
 
-  while test -n "$choice" && [[ $choice -lt 1 || $choice -gt ${#opts[@]} ]]
-  do
-    read -s -p "Please pick a valid number? " -n 1 choice
-    echo "$choice"
-  done
-  echo ""
+    return result.returncode == 0
 
-  test -z "$choice" && choice=1
+def package_installed(pkgname):
+    cmd = ['pacman', '-Qi', pkgname]
+    result = subprocess.run(cmd, capture_output=True, text=True)
 
-  ((choice--))
+    return result.returncode == 0
 
-  case ${opts[$choice]} in
-    "None")
-      return 1
-      ;;
-    "Pacman")
-      /usr/bin/sh -c "sudo pacman -S $dep"
-      ;;
-    "AUR")
-      install_package $dep
-      ;;
-  esac
-}
+def aur_download(pkgname):
+    cwd_path = f"{AUR_HOME}/{pkgname}"
+    if os.path.exists(cwd_path):
+        print(f"Updating {pkgname}...")
+        cmd = ['git', 'pull']
+        result = subprocess.run(cmd, cwd=cwd_path)
+    else:
+        cmd = ['git', 'clone', f"{AUR_URL}/{pkgname}.git"]
+        result = subprocess.run(cmd, cwd=AUR_HOME)
 
-# Install an AUR package
-install_package() {
-  local name=$1
-  echo -e "Install $BOLD$name$CLEAR from ${BOLD}AUR${CLEAR}"
+def aur_build(pkgname, flags):
+    cwd_path = f"{AUR_HOME}/{pkgname}"
+    if not os.path.exists(cwd_path):
+        return False
+    else:
+        cmd = ['makepkg', *flags.split(' ')]
+        result = subprocess.run(cmd, cwd=cwd_path)
+        return result.returncode == 0 or result.returncode == 13
 
-  download_package $name
-  if test $? -ne 0
-  then
-    fail $name 
-    return 1
-  fi
+def aur_get_tarball_path(pkgname):
+    cwd_path = f"{AUR_HOME}/{pkgname}"
+    if not os.path.exists(cwd_path):
+        print(f"Failed to locate '{pkgname}' tarball")
+        return ""
+    else:
+        cmd = ['makepkg', '--packagelist']
+        result = subprocess.run(cmd, cwd=cwd_path, capture_output=True, text=True)
+      
+        tarball_re = r"\.tar\.[a-zA-Z]*$"
+        for line in result.stdout.splitlines():
+            if re.search(tarball_re, line):
+                return line
+    return ""
 
 
-  # Get Dependencies
-  local -A srcinfo
+def aur_queue_deps(pkgname):
+    cwd_path = f"{AUR_HOME}/{pkgname}"
 
-  while IFS="=" read -r key value; do
-    # Skip comments and empty lines
-    [[ "$key" =~ ^\s*# ]] && continue
-    [[ -z "$key" ]] && continue
+    deps = []
+    with open(f'{cwd_path}/.SRCINFO', "r") as f_srcinfo:
+        body = f_srcinfo.read()
 
-    # Remove leading/trailing whitespace from key and value
-    key=$(echo "$key" | xargs)
-    value=$(echo "$value" | xargs)
+        dep_pat = r"\b(check|make)?depends\b *= *(.*)"
+        for match in re.finditer(dep_pat, body):
+            pkg = match.group(2)
+            if package_installed(pkg):
+                continue
+            deps.append(pkg)
 
-    if [[ -n "$key" ]]; then
-      srcinfo["$key"]+="$value "
-    fi
-  done < "$name/.SRCINFO"
+        optdep_pat = r"\boptdepends\b *= *([^:]*): *(.*)"
+        for match in re.finditer(optdep_pat, body):
+            optpkg = match.group(1)
+            optdesc = match.group(2)
 
-  # Install dependencies
-  for makedep in ${srcinfo["makedepends"]}
-  do
-    local dep=$makedep
-    install_dep $name $dep && continue
-    echo -e "Require ${BOLD}${dep}${CLEAR} to install ${BOLD}${name}${CLEAR}."
+            if package_installed(optpkg):
+                continue
 
-    fail $name
-    return 1
-  done
+            print(f"Install optional dependency '{optpkg}': {optdesc}\n")
+            while True:
+                choice = input("(y/n) > ")
+                if choice == 'y':
+                    deps.append(optpkg)
+                    break
+                elif choice == 'n':
+                    break
+            print()
 
-  cd $name
-  makepkg -si
-  cd ..
+             
+    return deps
 
-  echo -e "${GREEN}Success:${CLEAR} Installed $BOLD$name$CLEAR"
-}
+def queue_package(pkgname, preferred="pacman", parent=None):
+    global pacman_pkgs
+    global aur_pkgs
 
-for i in ${@}
-do
-  install_package $i
-done
+    if pkgname in pacman_pkgs or pkgname in aur_pkgs:
+        return
 
-test ${#failed_packages[@]} -eq 0 && exit 0
+    preferred = preferred.lower()
 
-echo ""
-echo "Listing failed packages:"
-echo ""
+    choices = []
 
-failed_file=$(mktemp -p $AURHOME ".fail_XXXXXX.log")
+    if preferred == 'pacman':
+        if pacman_exists(pkgname):
+            pacman_pkgs.append(PacmanPkgData(pkgname, parent != None))
+            return
+        choices.append('AUR') if aur_exists(pkgname) else ""
+    elif preferred == 'aur':
+        if aur_exists(pkgname):
+            aur_pkgs.append(AurPkgData(pkgname)) if not parent else aur_pkgs.insert(0, AurPkgData(pkgname, parent))
 
-for pkg in $failed_packages
-do
-  echo -e "${RED}error:${CLEAR} Failed to install ${BOLD}$pkg${CLEAR}"
-  echo "$pkg" >> $failed_file
-done
+            return
+        choices.append('Pacman') if pacman_exists(pkgname) else ""
+    else:
+        choices.append('Pacman') if pacman_exists(pkgname) else ""
+        choices.append('AUR') if aur_exists(pkgname) else ""
 
-echo -e "${YELLOW}info:${CLEAR} Fail log can be found at ${BOLD}$failed_file${CLEAR}"
+    if len(choices) == 0:
+        raise PackageException(f"package '{pkgname}' was not found")
+    elif len(choices) == 1:
+        if choices[0] == 'Pacman':
+            pacman_pkgs.append(PacmanPkgData(pkgname)) if not parent else pacman_pkgs.insert(0, PacmanPkgData(pkgname, parent != None))
+        elif choices[0] == 'AUR':
+            aur_pkgs.append(AurPkgData(pkgname)) if not parent else aur_pkgs.insert(0, AurPkgData(pkgname, parent))
+        else:
+            raise PackageException(f"package '{pkgname}' was not found")
+    else:
+        choice=0
+        print("Pick one of the following programs to install", end=" ")
+        cprint(pkgname, attrs=["bold"])
+        print()
+
+        for i in range(len(choices)):
+            print("%d)" % (i + 1), end=" ")
+            cprint(choices[i], attrs=["bold"])
+        print(f"\n(Default: {choices[0]})\n")
+
+        while choice <= 0 or choice > len(choices):
+
+            raw_choice = input("> ")
+            try:
+                choice = 1 if raw_choice == "" else int(raw_choice) 
+            except ValueError:
+                pass
+
+def aur_gen_build_queue(pkg):
+    children = pkg.children
+    if len(children) == 0:
+        return []
+
+    queue = [children]
+    for child in children:
+        queue = [*aur_gen_build_queue(child), *queue]
+   
+    print(queue)
+    return queue
+
+def clear_cache(pkgs):
+    print(f"AURHOME is set to '{AUR_HOME}'")
+    if len(pkgs) == 0:
+        path = Path(f'{AUR_HOME}')
+        dirs = [p for p in path.iterdir() if p.is_dir()]
+        
+        if len(dirs) == 0:
+            print("Nothing to do.")
+            exit(0)
+
+        dir_names = ' '.join([path.name for path in dirs])
+        print(f'Remove directories? {dir_names}')
+        while True:
+            choice = input('(y/n) > ')
+            if choice == 'y':
+                for d in dirs:
+                    shutil.rmtree(d)
+                break
+            elif choice == 'n':
+                break
+    else:
+        for pkg in pkgs:
+            validate_re = r"^ *\.\."
+            if re.match(validate_re, pkg):
+                print(f"'{pkg}' contains invalid sequence '..'")
+                exit(1)
+        dirs = [Path(f'{AUR_HOME}/{pkg}') for pkg in pkgs]
+        for path in dirs:
+            if not path.is_dir():
+                print(f"'{path.name}' is not a valid directory")
+                exit(1)
+        
+        if len(dirs) == 0:
+            print("Nothing to do.")
+            exit(0)
+
+        dir_names = ' '.join([path.name for path in dirs])
+        print(f'Remove directories? {dir_names}')
+        while True:
+            choice = input('(y/n) > ')
+            if choice == 'y':
+                for d in dirs:
+                    shutil.rmtree(d)
+                break
+            elif choice == 'n':
+                break
+
+def aur_recurse_deps(preferred_installer):
+    aur_dep_queue = deque(aur_pkgs)
+
+    while len(aur_dep_queue) > 0:
+        pkg = aur_dep_queue.popleft()
+        aur_download(pkg.name)
+
+        deps = aur_queue_deps(pkg.name)
+
+        for dep in deps:
+            if package_queued(dep):
+                continue
+
+            queue_package(dep, preferred=preferred_installer, parent=pkg)
+
+            for p in aur_pkgs:
+                if p.name == dep:
+                    aur_dep_queue.appendleft(AurPkgData(dep, pkg))
+                    break
+
+def install_pacman_pkgs():
+    pacman_deps = list(filter(lambda pkg: pkg.is_dep, pacman_pkgs))
+
+    if len(pacman_pkgs) > 0:
+        cmd = ["sudo", "pacman", "-S", *[pkg.name for pkg in pacman_pkgs]]
+        print(' '.join(cmd))
+        subprocess.run(cmd)
+
+    if len(pacman_deps) > 0:
+        cmd = ["sudo", "pacman", "-D", "--asdeps", *[pkg.name for pkg in pacman_deps]]
+        print(' '.join(cmd))
+        subprocess.run(cmd)
+
+def install_aur_pkgs(flags):
+    aur_parents = [pkg for pkg in aur_pkgs if pkg.parent == None]
+    aur_build_queue = [aur_parents]
+    for parent in aur_parents:
+        aur_build_queue = [*aur_gen_build_queue(parent), *aur_build_queue]
+
+    for deps in aur_build_queue:
+        tarballs = []
+        for dep in deps:
+            if not aur_build(dep.name, flags):
+                print(f"Failed to build {dep.name}")
+                aur_pkgs.remove(dep)
+                continue
+            tarballs.append(aur_get_tarball_path(dep.name))
+        if len(tarballs) > 0:
+            cmd = ["sudo", "pacman", "-U", *tarballs]
+            print(' '.join(cmd))
+            subprocess.run(cmd)
+
+    aur_deps = list(filter(lambda pkg: pkg.parent != None, aur_pkgs))
+    if len(aur_deps) > 0:
+        cmd = ["sudo", "pacman", "-D", "--asdeps", *[pkg.name for pkg in aur_deps]]
+        print(' '.join(cmd))
+        subprocess.run(cmd)
+
+def gen_args():
+    parser = argparse.ArgumentParser(
+            prog="aur-make",
+            description="AUR package installer alternative to yay"
+            )
+    parser.exit_on_error = True
+
+    parser.add_argument('-p', '--preferred-installer', default="pacman", choices=['pacman','aur','none'])
+    parser.add_argument('-cc', '--clear-cache', action="store_true")
+    parser.add_argument('--home-dir', default=f"{AUR_HOME}")
+
+    parser.add_argument('pkgs', nargs=argparse.REMAINDER).completer = PkgCompleter
+    parser.add_argument('-D', dest="makepkg_flags", nargs="?", default="") 
+
+    argcomplete.autocomplete(parser)
+    return parser.parse_args()
+
+if __name__ == "__main__":
+    args = gen_args()
+
+    AUR_HOME = args.home_dir
+    
+    if args.clear_cache:
+        clear_cache(args.pkgs)
+        exit(0)
+
+    install_queue = args.pkgs
+    for pkg in install_queue:
+        queue_package(pkg, preferred=args.preferred_installer)
+
+    aur_recurse_deps(args.preferred_installer)
+    
+    install_pacman_pkgs()
+    install_aur_pkgs(args.makepkg_flags)
+
